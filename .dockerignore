@@ -1,0 +1,10 @@
+**/__pycache__
+**/.pytest_cache
+**/.next
+**/node_modules
+.git
+.gitignore
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
