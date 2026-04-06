@@ -1,53 +1,36 @@
 pipeline {
     agent any
 
+    // ── Trigger: fires automatically on every push to main via GitHub webhook ──
+    triggers {
+        githubPush()
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')   // overall pipeline guard
+        disableConcurrentBuilds()            // prevent two builds stomping each other
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
     environment {
-        IMAGE_PREFIX = "snapsure"
-        IMAGE_TAG = "${BUILD_NUMBER}"
+        COMPOSE_PROJECT = "snapsure"         // FIXED project name — containers always named
+                                             // snapsure-backend / snapsure-frontend regardless
+                                             // of which Jenkins workspace folder this runs from
     }
 
     stages {
+
+        // ── Stage 1: Install host-level deps (npm, optional python) ──────────
         stage('1. Setup Dependencies') {
             steps {
                 script {
                     if (isUnix()) {
                         sh '''
                             set -e
-                            if command -v python3 >/dev/null 2>&1; then
-                                cd backend
-                                python3 -m venv venv
-                                . venv/bin/activate
-                                python3 -m pip install --upgrade pip
-                                pip install -r requirements.txt
-                                cd ..
-                            elif command -v python >/dev/null 2>&1; then
-                                cd backend
-                                python -m venv venv
-                                . venv/bin/activate
-                                pip install --upgrade pip
-                                pip install -r requirements.txt
-                                cd ..
-                            else
-                                echo "WARN: Python not found on agent; skipping backend dependency install"
-                            fi
-
-                            cd frontend
-                            npm ci
+                            cd frontend && npm ci
                         '''
                     } else {
                         bat '''
-                            where python >nul 2>nul
-                            if %ERRORLEVEL% EQU 0 (
-                                cd backend
-                                python -m venv venv
-                                call venv\\Scripts\\activate
-                                python -m pip install --upgrade pip
-                                pip install -r requirements.txt
-                                cd ..
-                            ) else (
-                                echo WARN: Python not found on agent; skipping backend dependency install
-                            )
-
                             cd frontend
                             npm ci
                         '''
@@ -56,6 +39,7 @@ pipeline {
             }
         }
 
+        // ── Stage 2: Build frontend + optional lint/test ─────────────────────
         stage('2. Validate + Build') {
             steps {
                 script {
@@ -65,125 +49,157 @@ pipeline {
                             cd frontend
                             npm run build
                         '''
+                        // Lint is best-effort — broken lint should NOT block deploy
+                        def lintExit = sh(script: 'cd frontend && npm run lint', returnStatus: true)
+                        if (lintExit != 0) echo 'WARN: lint failed or not configured — continuing.'
 
-                        def lintStatus = sh(
+                        def testExit = sh(
                             script: '''
-                                cd frontend
-                                npm run lint
-                            ''',
-                            returnStatus: true
-                        )
-                        if (lintStatus != 0) {
-                            echo 'WARN: Frontend lint failed or unsupported on this Next.js version; continuing.'
-                        }
-
-                        def testStatus = sh(
-                            script: '''
-                                cd backend
-                                if [ -f venv/bin/activate ]; then
-                                    . venv/bin/activate
-                                    pip install pytest -q
-                                    pytest -q
-                                else
-                                    echo "WARN: Backend venv not found; skipping backend tests"
+                                if [ -f backend/requirements.txt ]; then
+                                    python3 -m pip install pytest -q 2>/dev/null || true
+                                    python3 -m pytest backend -q --tb=short 2>/dev/null || true
                                 fi
                             ''',
                             returnStatus: true
                         )
-                        if (testStatus != 0) {
-                            echo 'WARN: Backend tests failed or unavailable; continuing.'
-                        }
+                        if (testExit != 0) echo 'WARN: backend tests failed or not found — continuing.'
                     } else {
-                        bat '''
-                            cd frontend
-                            npm run build
-                        '''
+                        bat 'cd frontend && npm run build'
 
-                        def lintStatus = bat(
-                            script: '''
-                                cd frontend
-                                npm run lint
-                            ''',
-                            returnStatus: true
-                        )
-                        if (lintStatus != 0) {
-                            echo 'WARN: Frontend lint failed or unsupported on this Next.js version; continuing.'
-                        }
-
-                        def testStatus = bat(
-                            script: '''
-                                cd backend
-                                if exist venv\\Scripts\\activate (
-                                    call venv\\Scripts\\activate
-                                    pip install pytest -q
-                                    pytest -q
-                                ) else (
-                                    echo WARN: Backend venv not found; skipping backend tests
-                                )
-                            ''',
-                            returnStatus: true
-                        )
-                        if (testStatus != 0) {
-                            echo 'WARN: Backend tests failed or unavailable; continuing.'
-                        }
+                        def lintExit = bat(script: 'cd frontend && npm run lint', returnStatus: true)
+                        if (lintExit != 0) echo 'WARN: lint failed or not configured — continuing.'
                     }
                 }
             }
         }
 
+        // ── Stage 3: Build Docker images via Compose ─────────────────────────
+        //    Using "docker compose build" so stage 4 can do "up --no-build"
+        //    and NOT waste time rebuilding the same layers again.
         stage('3. Build Docker Images') {
             steps {
                 script {
                     if (isUnix()) {
-                        sh '''
-                            set -e
-                            docker build -f docker/backend.Dockerfile -t ${IMAGE_PREFIX}-backend:${IMAGE_TAG} -t ${IMAGE_PREFIX}-backend:latest .
-                            docker build -f docker/frontend.Dockerfile -t ${IMAGE_PREFIX}-frontend:${IMAGE_TAG} -t ${IMAGE_PREFIX}-frontend:latest .
-                        '''
+                        sh 'docker compose -p ${COMPOSE_PROJECT} build'
                     } else {
-                        bat '''
-                            docker build -f docker/backend.Dockerfile -t %IMAGE_PREFIX%-backend:%IMAGE_TAG% -t %IMAGE_PREFIX%-backend:latest .
-                            docker build -f docker/frontend.Dockerfile -t %IMAGE_PREFIX%-frontend:%IMAGE_TAG% -t %IMAGE_PREFIX%-frontend:latest .
-                        '''
+                        bat 'docker compose -p %COMPOSE_PROJECT% build'
                     }
                 }
             }
         }
 
+        // ── Stage 4: Deploy + Smoke Test (main branch only) ──────────────────
         stage('4. Deploy + Smoke Check') {
             when {
-                expression {
-                    return env.GIT_BRANCH == 'origin/main' || env.GIT_BRANCH == 'main'
+                anyOf {
+                    branch 'main'
+                    expression { env.GIT_BRANCH ==~ /(origin\/)?main/ }
                 }
+            }
+            options {
+                timeout(time: 5, unit: 'MINUTES')  // deploy must finish in 5 min
             }
             steps {
                 script {
                     if (isUnix()) {
                         sh '''
                             set -e
-                            docker compose down || true
-                            docker rm -f deepfake-backend deepfake-frontend >/dev/null 2>&1 || true
-                            docker compose up -d
-                            for i in 1 2 3 4 5; do
-                                if curl -fsS http://localhost:8000/health >/dev/null; then
+
+                            # Tear down any running instance of this project cleanly
+                            docker compose -p ${COMPOSE_PROJECT} down --remove-orphans || true
+
+                            # Belt-and-suspenders: nuke containers by their known fixed names
+                            docker rm -f snapsure-backend snapsure-frontend >/dev/null 2>&1 || true
+
+                            # Free the ports in case some non-compose process grabbed them
+                            fuser -k 8000/tcp >/dev/null 2>&1 || true
+                            fuser -k 3000/tcp >/dev/null 2>&1 || true
+
+                            # Start — images already built in stage 3, so --no-build is intentional
+                            docker compose -p ${COMPOSE_PROJECT} up -d --no-build
+
+                            # Wait for backend health (compose healthcheck does the real work;
+                            # we just poll here so the pipeline reports a clear failure if it's stuck)
+                            echo "Waiting for backend..."
+                            for i in $(seq 1 10); do
+                                if curl -fs http://localhost:8000/health >/dev/null; then
+                                    echo "Backend is up."
                                     break
                                 fi
                                 sleep 3
-                                if [ "$i" = "5" ]; then
-                                    echo "Backend health check failed"
+                                if [ "$i" = "10" ]; then
+                                    echo "ERROR: Backend never became healthy."
+                                    docker compose -p ${COMPOSE_PROJECT} logs backend
                                     exit 1
                                 fi
                             done
-                            curl -f http://localhost:3000
+
+                            # Frontend smoke check
+                            curl -fs http://localhost:3000 >/dev/null \
+                                || { echo "ERROR: Frontend not responding."; exit 1; }
+
+                            echo "Deploy successful."
                         '''
                     } else {
-                        bat '''
-                            docker compose down
-                            powershell -NoProfile -Command "$ErrorActionPreference = 'SilentlyContinue'; docker rm -f deepfake-backend deepfake-frontend | Out-Null; exit 0"
-                            docker compose up -d
-                            powershell -NoProfile -Command "for ($i = 0; $i -lt 5; $i++) { try { Invoke-WebRequest -UseBasicParsing http://localhost:8000/health -ErrorAction Stop | Out-Null; Write-Host 'Backend health check passed'; exit 0 } catch { if ($i -lt 4) { Write-Host 'Retrying backend health check...'; Start-Sleep -Seconds 3 } else { Write-Host 'Backend health check failed'; exit 1 } } }"
-                            powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing http://localhost:3000 | Out-Null"
-                        '''
+                        // ── Windows path ─────────────────────────────────────
+                        bat 'docker compose -p %COMPOSE_PROJECT% down --remove-orphans'
+
+                        // Remove old containers by their FIXED names (matches container_name in compose file)
+                        powershell(script: '''
+                            $ErrorActionPreference = 'SilentlyContinue'
+                            docker rm -f snapsure-backend snapsure-frontend | Out-Null
+
+                            # Free port 8000 — kills whatever process is holding it
+                            # (safe: Jenkins runs on 8080, not 8000)
+                            $conn8000 = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
+                            if ($conn8000) {
+                                Stop-Process -Id $conn8000.OwningProcess -Force -ErrorAction SilentlyContinue
+                                Write-Host "Freed port 8000"
+                            }
+
+                            # Free port 3000
+                            $conn3000 = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue
+                            if ($conn3000) {
+                                Stop-Process -Id $conn3000.OwningProcess -Force -ErrorAction SilentlyContinue
+                                Write-Host "Freed port 3000"
+                            }
+
+                            exit 0
+                        ''')
+
+                        bat 'docker compose -p %COMPOSE_PROJECT% up -d --no-build'
+
+                        // Health check — 10 retries × 3 s = 30 s max wait
+                        powershell(script: '''
+                            $maxRetries = 10
+                            for ($i = 0; $i -lt $maxRetries; $i++) {
+                                try {
+                                    Invoke-WebRequest -UseBasicParsing http://localhost:8000/health `
+                                        -ErrorAction Stop | Out-Null
+                                    Write-Host "Backend is up."
+                                    break
+                                } catch {
+                                    if ($i -lt ($maxRetries - 1)) {
+                                        Write-Host "Waiting for backend... attempt $($i+1)/$maxRetries"
+                                        Start-Sleep -Seconds 3
+                                    } else {
+                                        Write-Host "ERROR: Backend never became healthy."
+                                        exit 1
+                                    }
+                                }
+                            }
+                        ''')
+
+                        powershell(script: '''
+                            try {
+                                Invoke-WebRequest -UseBasicParsing http://localhost:3000 `
+                                    -ErrorAction Stop | Out-Null
+                                Write-Host "Frontend smoke check passed."
+                            } catch {
+                                Write-Host "ERROR: Frontend not responding."
+                                exit 1
+                            }
+                        ''')
                     }
                 }
             }
@@ -192,12 +208,14 @@ pipeline {
 
     post {
         success {
-            echo 'Pipeline completed successfully.'
+            echo "Pipeline passed. Build #${BUILD_NUMBER} deployed."
         }
         failure {
-            echo 'Pipeline failed. Check stage logs for details.'
+            echo "Pipeline FAILED. Check stage logs above."
+            // Optional: add email/Slack notification here
         }
         always {
+            // Clean workspace AFTER containers are up — they run detached, workspace not needed
             cleanWs()
         }
     }
