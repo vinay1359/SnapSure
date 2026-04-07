@@ -108,9 +108,6 @@ pipeline {
                             # Tear down any running instance of this project cleanly
                             docker compose -p ${COMPOSE_PROJECT} down --remove-orphans || true
 
-                            # Belt-and-suspenders: nuke containers by their known fixed names
-                            docker rm -f snapsure-backend snapsure-frontend >/dev/null 2>&1 || true
-
                             # Free the ports in case some non-compose process grabbed them
                             fuser -k 8000/tcp >/dev/null 2>&1 || true
                             fuser -k 3000/tcp >/dev/null 2>&1 || true
@@ -147,10 +144,7 @@ pipeline {
                         // Remove old containers by their FIXED names (matches container_name in compose file)
                         powershell(script: '''
                             $ErrorActionPreference = 'SilentlyContinue'
-                            docker rm -f snapsure-backend snapsure-frontend | Out-Null
-
-                            # Free port 8000 — kills whatever process is holding it
-                            # (safe: Jenkins runs on 8080, not 8000)
+                    
                             $conn8000 = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
                             if ($conn8000) {
                                 Stop-Process -Id $conn8000.OwningProcess -Force -ErrorAction SilentlyContinue
