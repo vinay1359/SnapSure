@@ -216,7 +216,7 @@ pipeline {
                                 echo "Minikube is missing/unhealthy. Recreating cluster..."
                                 minikube stop >/dev/null 2>&1 || true
                                 minikube delete >/dev/null 2>&1 || true
-                                minikube start --driver=docker
+                                minikube start --driver=docker --container-runtime=docker
                             fi
 
                             echo "Waiting for Kubernetes API..."
@@ -245,9 +245,23 @@ pipeline {
                                 $PSNativeCommandUseErrorActionPreference = $false
                             }
 
+                            function Invoke-CmdLine {
+                                param(
+                                    [Parameter(Mandatory = $true)][string] $CommandLine,
+                                    [switch] $AllowFailure
+                                )
+
+                                & cmd.exe /d /c "($CommandLine) 2>&1" | ForEach-Object { Write-Host $_ }
+                                $exitCode = $LASTEXITCODE
+                                if (($exitCode -ne 0) -and (-not $AllowFailure)) {
+                                    exit $exitCode
+                                }
+                                return $exitCode
+                            }
+
                             Write-Host "Starting Minikube..."
 
-                            $status = (& minikube status 2>$null | Out-String)
+                            $status = (& cmd.exe /d /c "minikube status 2>NUL" | Out-String)
                             $healthy = ($LASTEXITCODE -eq 0) -and
                                        ($status -match "host:\\s+Running") -and
                                        ($status -match "kubelet:\\s+Running") -and
@@ -257,16 +271,15 @@ pipeline {
                                 Write-Host "Minikube is healthy."
                             } else {
                                 Write-Host "Minikube is missing/unhealthy. Recreating cluster..."
-                                & minikube stop 2>&1 | Out-Host
-                                & minikube delete 2>&1 | Out-Host
-                                & minikube start --driver=docker 2>&1 | Out-Host
-                                if ($LASTEXITCODE -ne 0) { exit 1 }
+                                Invoke-CmdLine "minikube stop" -AllowFailure | Out-Null
+                                Invoke-CmdLine "minikube delete" -AllowFailure | Out-Null
+                                Invoke-CmdLine "minikube start --driver=docker --container-runtime=docker" | Out-Null
                             }
 
                             Write-Host "Waiting for Kubernetes API..."
                             $ready = $false
                             for ($i = 1; $i -le 18; $i++) {
-                                $statusNow = (& minikube status 2>$null | Out-String)
+                                $statusNow = (& cmd.exe /d /c "minikube status 2>NUL" | Out-String)
                                 $ready = ($LASTEXITCODE -eq 0) -and
                                          ($statusNow -match "host:\\s+Running") -and
                                          ($statusNow -match "kubelet:\\s+Running") -and
@@ -276,15 +289,12 @@ pipeline {
                             }
                             if (-not $ready) {
                                 Write-Host "ERROR: Minikube components did not become healthy in time."
-                                minikube status | Out-Host
+                                Invoke-CmdLine "minikube status" -AllowFailure | Out-Null
                                 exit 1
                             }
 
-                            & kubectl cluster-info 2>&1 | Out-Host
-                            if ($LASTEXITCODE -ne 0) { exit 1 }
-
-                            & kubectl get nodes 2>&1 | Out-Host
-                            if ($LASTEXITCODE -ne 0) { exit 1 }
+                            Invoke-CmdLine "kubectl cluster-info" | Out-Null
+                            Invoke-CmdLine "kubectl get nodes" | Out-Null
                         '''
                     }
                 }
@@ -300,15 +310,19 @@ pipeline {
                         if (isUnix()) {
                             sh '''
                                 set -e
-                                echo "=== Cleaning old Minikube images before load ==="
+                                echo "=== Preparing Minikube image store ==="
                                 
-                                # Remove dangling images from Minikube (untagged layers)
-                                echo "Removing dangling images..."
-                                minikube image rm --all || echo "No dangling images to remove"
+                                # Remove only this project's previous mutable tags, then prune unreferenced layers.
+                                echo "Removing previous SnapSure image tags from Minikube..."
+                                minikube image rm "${FRONTEND_IMAGE}" >/dev/null 2>&1 || true
+                                minikube image rm "${BACKEND_IMAGE}" >/dev/null 2>&1 || true
+                                minikube ssh -- docker image prune -f >/dev/null 2>&1 \
+                                    || minikube ssh -- sudo crictl rmi --prune >/dev/null 2>&1 \
+                                    || true
                                 
                                 # Show current image count before
                                 BEFORE_COUNT=$(minikube image ls | wc -l)
-                                echo "Images before cleanup: $BEFORE_COUNT"
+                                echo "Images before load: $BEFORE_COUNT"
                                 
                                 echo "=== Loading Docker images into Minikube ==="
                                 
@@ -346,21 +360,41 @@ pipeline {
                                 echo "Verifying images in Minikube..."
                                 minikube image ls | grep snapsure || echo "Checking images..."
                                 
-                                echo "✓ Images loaded successfully."
+                                echo "[OK] Images loaded successfully."
                             '''
                         } else {
                             // Windows path — show size & progress via output
                             powershell(script: '''
                                 $ErrorActionPreference = "Continue"
+                                if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+                                    $PSNativeCommandUseErrorActionPreference = $false
+                                }
+
+                                function Invoke-CmdLine {
+                                    param(
+                                        [Parameter(Mandatory = $true)][string] $CommandLine,
+                                        [switch] $AllowFailure
+                                    )
+
+                                    & cmd.exe /d /c "($CommandLine) 2>&1" | ForEach-Object { Write-Host "  $_" }
+                                    $exitCode = $LASTEXITCODE
+                                    if (($exitCode -ne 0) -and (-not $AllowFailure)) {
+                                        exit $exitCode
+                                    }
+                                    return $exitCode
+                                }
                                 
-                                Write-Host "=== Cleaning old Minikube images before load ===" -ForegroundColor Cyan
+                                Write-Host "=== Preparing Minikube image store ===" -ForegroundColor Cyan
                                 
-                                # Remove dangling images from Minikube
-                                Write-Host "Removing dangling images from Minikube..." -ForegroundColor Green
-                                & minikube image rm --all 2>&1 | Out-Host
+                                # Remove only this project's previous mutable tags, then prune unreferenced layers.
+                                Write-Host "Removing previous SnapSure image tags from Minikube..." -ForegroundColor Green
+                                Invoke-CmdLine "minikube image rm $env:FRONTEND_IMAGE" -AllowFailure | Out-Null
+                                Invoke-CmdLine "minikube image rm $env:BACKEND_IMAGE" -AllowFailure | Out-Null
+                                Write-Host "Pruning dangling Minikube runtime layers..." -ForegroundColor Green
+                                Invoke-CmdLine "minikube ssh -- docker image prune -f || minikube ssh -- sudo crictl rmi --prune" -AllowFailure | Out-Null
                                 
                                 # Show image count before
-                                $beforeCount = (& minikube image ls 2>&1 | Measure-Object -Line).Lines
+                                $beforeCount = (& cmd.exe /d /c "minikube image ls 2>&1" | Measure-Object -Line).Lines
                                 Write-Host "  Images before load: $beforeCount" -ForegroundColor DarkGray
                                 
                                 Write-Host "=== Loading Docker images into Minikube ===" -ForegroundColor Cyan
@@ -372,13 +406,9 @@ pipeline {
                                 Write-Host "  Size: $([Math]::Round($frontendSize / 1MB, 2))MB" -ForegroundColor DarkGray
                                 
                                 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                                & minikube image load $env:FRONTEND_IMAGE 2>&1 | ForEach-Object { Write-Host "  $_" }
+                                Invoke-CmdLine "minikube image load $env:FRONTEND_IMAGE" | Out-Null
                                 $stopwatch.Stop()
-                                if ($LASTEXITCODE -ne 0) {
-                                    Write-Host "ERROR: Failed loading frontend image into Minikube" -ForegroundColor Red
-                                    exit 1
-                                }
-                                Write-Host "  ✓ Frontend loaded in $($stopwatch.Elapsed.TotalSeconds)s" -ForegroundColor Green
+                                Write-Host "  [OK] Frontend loaded in $($stopwatch.Elapsed.TotalSeconds)s" -ForegroundColor Green
                                 
                                 # Load backend image with size info
                                 Write-Host "Loading backend image: $env:BACKEND_IMAGE" -ForegroundColor Green
@@ -388,25 +418,15 @@ pipeline {
                                 Write-Host "  (This may take several minutes for large images)" -ForegroundColor DarkYellow
                                 
                                 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                                & minikube image load $env:BACKEND_IMAGE 2>&1 | ForEach-Object { 
-                                    Write-Host "  $_"
-                                    # Show progress every 30 seconds
-                                    if ($stopwatch.Elapsed.TotalSeconds % 30 -lt 2) {
-                                        Write-Host "  ⏱ Elapsed: $($stopwatch.Elapsed.TotalSeconds -as [int])s..." -ForegroundColor DarkYellow
-                                    }
-                                }
+                                Invoke-CmdLine "minikube image load $env:BACKEND_IMAGE" | Out-Null
                                 $stopwatch.Stop()
-                                if ($LASTEXITCODE -ne 0) {
-                                    Write-Host "ERROR: Failed loading backend image into Minikube" -ForegroundColor Red
-                                    exit 1
-                                }
-                                Write-Host "  ✓ Backend loaded in $($stopwatch.Elapsed.TotalSeconds)s" -ForegroundColor Green
+                                Write-Host "  [OK] Backend loaded in $($stopwatch.Elapsed.TotalSeconds)s" -ForegroundColor Green
                                 
                                 # Verify images
                                 Write-Host "Verifying images in Minikube..." -ForegroundColor Green
-                                & minikube image ls 2>&1 | Select-String "snapsure" | Out-Host
+                                & cmd.exe /d /c "minikube image ls 2>&1" | Select-String "snapsure" | Out-Host
                                 
-                                Write-Host "✓ Images loaded successfully." -ForegroundColor Green
+                                Write-Host "[OK] Images loaded successfully." -ForegroundColor Green
                             ''')
                         }
                     } catch (Exception e) {
@@ -654,9 +674,11 @@ pipeline {
                                 set -e
                                 echo "=== Stage 9: Cleanup & Prune Storage ==="
                                 
-                                # Prune dangling images from Minikube
-                                echo "Pruning dangling images from Minikube..."
-                                minikube image rm --all 2>/dev/null || echo "  (no dangling images)"
+                                # Keep current SnapSure images for running pods; prune only unused layers.
+                                echo "Pruning dangling Minikube runtime layers..."
+                                minikube ssh -- docker image prune -f >/dev/null 2>&1 \
+                                    || minikube ssh -- sudo crictl rmi --prune >/dev/null 2>&1 \
+                                    || echo "  (Minikube runtime prune skipped)"
                                 
                                 # Show final Minikube image count
                                 AFTER_COUNT=$(minikube image ls 2>/dev/null | wc -l)
@@ -671,21 +693,38 @@ pipeline {
                                 # Uncomment if you want to remove ALL unused images (including stopped container images)
                                 # docker image prune -a -f --filter "until=72h"
                                 
-                                echo "✓ Cleanup complete"
+                                echo "[OK] Cleanup complete"
                             '''
                         } else {
                             // Windows path
                             powershell(script: '''
                                 $ErrorActionPreference = "Continue"
+                                if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+                                    $PSNativeCommandUseErrorActionPreference = $false
+                                }
+
+                                function Invoke-CmdLine {
+                                    param(
+                                        [Parameter(Mandatory = $true)][string] $CommandLine,
+                                        [switch] $AllowFailure
+                                    )
+
+                                    & cmd.exe /d /c "($CommandLine) 2>&1" | ForEach-Object { Write-Host "  $_" }
+                                    $exitCode = $LASTEXITCODE
+                                    if (($exitCode -ne 0) -and (-not $AllowFailure)) {
+                                        exit $exitCode
+                                    }
+                                    return $exitCode
+                                }
                                 
                                 Write-Host "=== Stage 9: Cleanup & Prune Storage ===" -ForegroundColor Cyan
                                 
-                                # Prune dangling images from Minikube
-                                Write-Host "Pruning dangling images from Minikube..." -ForegroundColor Green
-                                & minikube image rm --all 2>&1 | Out-Host
+                                # Keep current SnapSure images for running pods; prune only unused layers.
+                                Write-Host "Pruning dangling Minikube runtime layers..." -ForegroundColor Green
+                                Invoke-CmdLine "minikube ssh -- docker image prune -f || minikube ssh -- sudo crictl rmi --prune" -AllowFailure | Out-Null
                                 
                                 # Show final Minikube image count
-                                $afterCount = (& minikube image ls 2>&1 | Measure-Object -Line).Lines
+                                $afterCount = (& cmd.exe /d /c "minikube image ls 2>&1" | Measure-Object -Line).Lines
                                 Write-Host "  Final images in Minikube: $afterCount" -ForegroundColor DarkGray
                                 
                                 # Prune local Docker
@@ -693,7 +732,7 @@ pipeline {
                                 $dockerPrune = (& docker image prune -f --filter "dangling=true" 2>&1 | Select-Object -Last 1)
                                 Write-Host "  $dockerPrune" -ForegroundColor DarkGray
                                 
-                                Write-Host "✓ Cleanup complete" -ForegroundColor Green
+                                Write-Host "[OK] Cleanup complete" -ForegroundColor Green
                             ''')
                         }
                     } catch (Exception e) {
