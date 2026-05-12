@@ -92,14 +92,8 @@ pipeline {
             }
         }
 
-        // ── Stage 4: Deploy + Smoke Test (main branch only) ──────────────────
+        // ── Stage 4: Deploy + Smoke Test ──────────────────
         stage('4. Deploy + Smoke Check') {
-            when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH ==~ /(origin\/)?main/ }
-                }
-            }
             options {
                 timeout(time: 5, unit: 'MINUTES')  // deploy must finish in 5 min
             }
@@ -205,99 +199,35 @@ pipeline {
             }
         }
 
-        // ── Stage 5: Start Minikube (Kubernetes deployment path) ─────────────
-        //    Conditional: only run on main branch or explicit trigger
-        stage('5. Minikube Start') {
-            when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH ==~ /(origin\/)?main/ }
-                }
-            }
+        // ── Stage 5: Start Minikube ───────────────────────────────────────────
+        stage('Start Minikube') {
             steps {
                 script {
-                    try {
-                        if (isUnix()) {
-                            // Linux/macOS path
-                            sh '''
-                                set -e
-                                echo "=== Starting Minikube ==="
-                                
-                                # Check if minikube is installed
-                                if ! command -v minikube &> /dev/null; then
-                                    echo "ERROR: Minikube not installed. Please install Minikube."
-                                    exit 1
-                                fi
-                                
-                                # Check if minikube cluster exists
-                                if minikube status &>/dev/null; then
-                                    echo "Minikube cluster exists. Checking status..."
-                                    MINIKUBE_STATUS=$(minikube status --format='{{.Host}}')
-                                    if [ "$MINIKUBE_STATUS" != "Running" ]; then
-                                        echo "Starting Minikube cluster..."
-                                        minikube start --driver=docker --memory=4096 --cpus=2 || \
-                                        minikube start --memory=4096 --cpus=2
-                                    else
-                                        echo "Minikube cluster is already running."
-                                    fi
-                                else
-                                    echo "Creating new Minikube cluster..."
-                                    minikube start --driver=docker --memory=4096 --cpus=2 || \
-                                    minikube start --memory=4096 --cpus=2
-                                fi
-                                
-                                # Verify cluster is running
-                                echo "Waiting for cluster to be ready..."
-                                minikube status
-                                
-                                # Set kubectl context to minikube
-                                kubectl config use-context minikube || true
-                                
-                                echo "Minikube started successfully."
-                            '''
-                        } else {
-                            // Windows path (PowerShell)
-                            powershell(script: '''
-                                $ErrorActionPreference = "Stop"
-                                
-                                Write-Host "=== Starting Minikube ==="
-                                
-                                # Check if minikube is installed
-                                $minikubeCmd = Get-Command minikube -ErrorAction SilentlyContinue
-                                if (-not $minikubeCmd) {
-                                    Write-Host "ERROR: Minikube not installed. Please install Minikube."
-                                    exit 1
-                                }
-                                
-                                # Check if cluster is running
-                                $status = minikube status --format='{{.Host}}' 2>&1
-                                
-                                if ($status -like "*Running*" -or $status -eq "Running") {
-                                    Write-Host "Minikube cluster is already running."
-                                } else {
-                                    Write-Host "Starting Minikube cluster..."
-                                    try {
-                                        minikube start --driver=docker --memory=4096 --cpus=2
-                                    } catch {
-                                        Write-Host "Docker driver failed, trying default driver..."
-                                        minikube start --memory=4096 --cpus=2
-                                    }
-                                }
-                                
-                                # Verify cluster is running
-                                Write-Host "Verifying Minikube status..."
-                                minikube status
-                                
-                                # Set kubectl context to minikube
-                                kubectl config use-context minikube -ErrorAction SilentlyContinue
-                                
-                                Write-Host "Minikube started successfully."
-                            ''')
-                        }
-                    } catch (Exception e) {
-                        echo "ERROR: Failed to start Minikube - ${e.message}"
-                        currentBuild.result = 'FAILURE'
-                        error("Minikube startup failed")
+                    if (isUnix()) {
+                        sh '''
+                            set -e
+                            echo "Starting Minikube..."
+                            minikube start --driver=docker
+                            echo "Waiting for Kubernetes API..."
+                            sleep 40
+                            kubectl cluster-info
+                            kubectl get nodes
+                        '''
+                    } else {
+                        powershell '''
+                            Write-Host "Starting Minikube..."
+                            minikube start --driver=docker
+                            if ($LASTEXITCODE -ne 0) { exit 1 }
+
+                            Write-Host "Waiting for Kubernetes API..."
+                            Start-Sleep -Seconds 40
+
+                            kubectl cluster-info
+                            if ($LASTEXITCODE -ne 0) { exit 1 }
+
+                            kubectl get nodes
+                            if ($LASTEXITCODE -ne 0) { exit 1 }
+                        '''
                     }
                 }
             }
@@ -305,12 +235,6 @@ pipeline {
 
         // ── Stage 6: Load Docker Images into Minikube ──────────────────────
         stage('6. Load Images to Minikube') {
-            when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH ==~ /(origin\/)?main/ }
-                }
-            }
             steps {
                 script {
                     try {
@@ -338,31 +262,43 @@ pipeline {
                         } else {
                             // Windows path
                             powershell(script: '''
-                                $ErrorActionPreference = "Stop"
+                                $ErrorActionPreference = "Continue"
                                 
                                 Write-Host "=== Loading Docker images into Minikube ==="
                                 
                                 # Load backend image
                                 Write-Host "Loading backend image: $env:BACKEND_IMAGE"
-                                try {
-                                    docker save $env:BACKEND_IMAGE | minikube image load -
-                                } catch {
-                                    Write-Host "Trying alternative image load method..."
-                                    minikube image load $env:BACKEND_IMAGE
+                                & docker image inspect $env:BACKEND_IMAGE *> $null
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Backend image not found: $env:BACKEND_IMAGE"
+                                    exit 1
+                                }
+                                & minikube image load $env:BACKEND_IMAGE 2>&1 | Out-Host
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Failed loading backend image into Minikube"
+                                    exit 1
                                 }
                                 
                                 # Load frontend image
                                 Write-Host "Loading frontend image: $env:FRONTEND_IMAGE"
-                                try {
-                                    docker save $env:FRONTEND_IMAGE | minikube image load -
-                                } catch {
-                                    Write-Host "Trying alternative image load method..."
-                                    minikube image load $env:FRONTEND_IMAGE
+                                & docker image inspect $env:FRONTEND_IMAGE *> $null
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Frontend image not found: $env:FRONTEND_IMAGE"
+                                    exit 1
+                                }
+                                & minikube image load $env:FRONTEND_IMAGE 2>&1 | Out-Host
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Failed loading frontend image into Minikube"
+                                    exit 1
                                 }
                                 
                                 # Verify images
                                 Write-Host "Verifying images in Minikube..."
-                                minikube image ls
+                                & minikube image ls 2>&1 | Out-Host
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Unable to list Minikube images"
+                                    exit 1
+                                }
                                 
                                 Write-Host "Images loaded successfully."
                             ''')
@@ -378,12 +314,6 @@ pipeline {
 
         // ── Stage 7: Deploy to Kubernetes ────────────────────────────────────
         stage('7. Deploy to Kubernetes') {
-            when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH ==~ /(origin\/)?main/ }
-                }
-            }
             steps {
                 script {
                     try {
@@ -411,22 +341,34 @@ pipeline {
                         } else {
                             // Windows path
                             powershell(script: '''
-                                $ErrorActionPreference = "Stop"
+                                $ErrorActionPreference = "Continue"
                                 
                                 Write-Host "=== Deploying to Kubernetes ==="
                                 
                                 # Set context
-                                kubectl config use-context minikube -ErrorAction SilentlyContinue
+                                & kubectl config use-context minikube 2>&1 | Out-Host
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Failed to set kubectl context to minikube"
+                                    exit 1
+                                }
                                 
                                 # Create namespace if not exists
                                 Write-Host "Creating namespace: $env:K8S_NAMESPACE"
                                 kubectl create namespace $env:K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Failed to create/apply namespace $env:K8S_NAMESPACE"
+                                    exit 1
+                                }
                                 
                                 # Apply all K8s manifests
                                 Write-Host "Applying Kubernetes manifests..."
                                 Get-ChildItem "k8s/*.yaml" | ForEach-Object {
                                     Write-Host "Applying: $($_.FullName)"
                                     kubectl apply -f $_.FullName
+                                    if ($LASTEXITCODE -ne 0) {
+                                        Write-Host "ERROR: Failed applying manifest $($_.FullName)"
+                                        exit 1
+                                    }
                                 }
                                 
                                 Write-Host "Kubernetes deployment applied successfully."
@@ -443,12 +385,6 @@ pipeline {
 
         // ── Stage 8: Verify Kubernetes Deployment ────────────────────────────
         stage('8. Verify Deployment') {
-            when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH ==~ /(origin\/)?main/ }
-                }
-            }
             options {
                 timeout(time: 10, unit: 'MINUTES')
             }
@@ -521,16 +457,24 @@ pipeline {
                         } else {
                             // Windows path
                             powershell(script: '''
-                                $ErrorActionPreference = "Stop"
+                                $ErrorActionPreference = "Continue"
                                 
                                 Write-Host "=== Verifying Kubernetes Deployment ==="
                                 
                                 # Set context
-                                kubectl config use-context minikube -ErrorAction SilentlyContinue
+                                & kubectl config use-context minikube 2>&1 | Out-Host
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Failed to set kubectl context to minikube"
+                                    exit 1
+                                }
                                 
                                 # Check namespace
                                 Write-Host "Checking namespace status..."
                                 kubectl get namespace $env:K8S_NAMESPACE
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "ERROR: Namespace not found: $env:K8S_NAMESPACE"
+                                    exit 1
+                                }
                                 
                                 # Wait for backend deployment
                                 Write-Host "Waiting for backend deployment..."
@@ -563,14 +507,14 @@ pipeline {
                                 Write-Host ""
                                 Write-Host "=== CHECKING POD HEALTH ==="
                                 
-                                $backendPod = kubectl get pods -n $env:K8S_NAMESPACE -l app=backend -o jsonpath='{.items[0].metadata.name}' 2>&1
+                                $backendPod = (& kubectl get pods -n $env:K8S_NAMESPACE -l app=backend -o jsonpath='{.items[0].metadata.name}' 2>$null | Out-String).Trim()
                                 if ($backendPod -and $backendPod -notlike "*No resources*") {
                                     Write-Host "Backend pod: $backendPod"
                                     Write-Host "Backend pod logs (last 20 lines):"
                                     kubectl logs $backendPod -n $env:K8S_NAMESPACE --tail=20 2>&1 | Out-Host
                                 }
                                 
-                                $frontendPod = kubectl get pods -n $env:K8S_NAMESPACE -l app=frontend -o jsonpath='{.items[0].metadata.name}' 2>&1
+                                $frontendPod = (& kubectl get pods -n $env:K8S_NAMESPACE -l app=frontend -o jsonpath='{.items[0].metadata.name}' 2>$null | Out-String).Trim()
                                 if ($frontendPod -and $frontendPod -notlike "*No resources*") {
                                     Write-Host "Frontend pod: $frontendPod"
                                     Write-Host "Frontend pod logs (last 20 lines):"
