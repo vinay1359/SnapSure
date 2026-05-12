@@ -180,20 +180,51 @@ Returns backend status and loaded model information.
 
 ### Pipeline Overview
 
+The Jenkins pipeline handles both Docker Compose deployment and Kubernetes deployment on the main branch:
+
 ```
-Code Push → Jenkins → Setup Deps → Build → Docker Build → Deploy + Smoke Test
+Code Push → Jenkins
+    ↓
+Stage 1: Setup Dependencies (npm, pip)
+    ↓
+Stage 2: Validate & Build (frontend build, lint, tests)
+    ↓
+Stage 3: Build Docker Images (snapsure-backend, snapsure-frontend)
+    ↓
+Stage 4: Deploy + Smoke Test (docker compose - all branches)
+    ↓
+Stage 5: Start Minikube (main branch only)
+    ↓
+Stage 6: Load Images to Minikube (main branch only)
+    ↓
+Stage 7: Deploy to Kubernetes (main branch only)
+    ↓
+Stage 8: Verify Deployment (main branch only)
 ```
 
-### Stages
+### Pipeline Stages
 
-| Stage | What it does |
-|---|---|
-| 1. Setup Dependencies | `pip install` backend deps, `npm ci` frontend deps |
-| 2. Validate + Build | `npm run build`, lint, backend pytest |
-| 3. Build Docker Images | Builds `snapsure-backend` and `snapsure-frontend` images |
-| 4. Deploy + Smoke Check | `docker compose up -d`, health check on `/health` and `/` (models auto-download from Hugging Face) |
+| Stage | What it does | Branch |
+|---|---|---|
+| 1. Setup Dependencies | `npm ci` frontend, `pip install` backend deps | All |
+| 2. Validate + Build | `npm run build`, lint, backend pytest | All |
+| 3. Build Docker Images | Builds `snapsure-backend` and `snapsure-frontend` images | All |
+| 4. Deploy + Smoke Check | `docker compose up -d`, health checks on `/health` and `/` | All |
+| 5. Minikube Start | Starts or ensures Minikube cluster is running | main |
+| 6. Load Images to Minikube | Loads built Docker images into Minikube's Docker daemon | main |
+| 7. Deploy to Kubernetes | Applies K8s manifests (namespace, deployment, service, configmap) | main |
+| 8. Verify Deployment | Waits for rollout, checks pod status, verifies services | main |
 
-Stage 4 runs only on the `main` branch.
+### Key Features
+
+✓ **Cross-platform**: Works on Linux, macOS, and Windows  
+✓ **Error Handling**: Automatic rollback and detailed error messages  
+✓ **Health Checks**: Verifies pods are running and healthy  
+✓ **Pod Logs**: Captures and displays container logs for debugging  
+✓ **Automatic Minikube**: Starts Minikube if not running  
+✓ **Image Loading**: Uses `minikube image load` with fallback methods  
+✓ **Concurrent Build Prevention**: Prevents duplicate builds  
+✓ **30-minute timeout**: Overall pipeline guard  
 
 ### Create Jenkins Job
 
@@ -205,6 +236,15 @@ Stage 4 runs only on the `main` branch.
    - **Branch:** `*/main`
    - **Script Path:** `Jenkinsfile`
 3. Save and click **Build Now**
+
+### Prerequisites
+
+Jenkins agent must have:
+- Docker installed
+- Minikube installed
+- kubectl installed
+- Git installed
+- Either `bash` (Linux/macOS) or `PowerShell` (Windows)
 
 ### Verify Docker Images After Build
 
@@ -218,11 +258,201 @@ snapsure-frontend   <build>   ...
 snapsure-backend    <build>   ...
 ```
 
+### Triggering the Pipeline
+
+**Option 1: GitHub Webhook (Automatic)**
+- Push to `main` branch triggers the pipeline automatically
+- Jenkins must be accessible from GitHub
+- Configure webhook in GitHub: Settings → Webhooks
+
+**Option 2: Manual Trigger**
+- Open Jenkins job → Click **Build Now**
+
 ---
 
-## Kubernetes Deployment (Minikube)
+## Kubernetes Deployment (Minikube + Jenkins)
 
-See [k8s/README-K8S.md](k8s/README-K8S.md) for the Windows-friendly Minikube workflow.
+### How It Works
+
+The Jenkins pipeline automatically handles Kubernetes deployment on the main branch:
+
+1. **Builds Docker images** in stages 1-3
+2. **Starts Minikube cluster** (stage 5)
+3. **Loads images into Minikube** (stage 6) - uses `minikube image load`
+4. **Deploys manifests** (stage 7) - runs `kubectl apply -f k8s/`
+5. **Verifies deployment** (stage 8) - waits for pods to be ready
+
+### Architecture
+
+```
+Jenkins Agent
+    ├─ docker build → snapsure-backend:latest
+    ├─ docker build → snapsure-frontend:latest
+    └─ minikube start
+        ├─ minikube image load snapsure-backend
+        ├─ minikube image load snapsure-frontend
+        ├─ kubectl apply -f k8s/
+        │   ├─ Namespace (snapsure)
+        │   ├─ ConfigMaps (backend-config, frontend-config)
+        │   ├─ Backend Deployment (replicas: 1)
+        │   ├─ Frontend Deployment (replicas: 1)
+        │   ├─ Backend Service (ClusterIP 8000)
+        │   └─ Frontend Service (NodePort 30300)
+        └─ kubectl rollout status
+            ├─ Wait for backend pod ready
+            └─ Wait for frontend pod ready
+```
+
+### Manifest Files
+
+All Kubernetes manifests are in `k8s/`:
+
+| File | Purpose |
+|---|---|
+| `00-namespace.yaml` | Creates `snapsure` namespace |
+| `01-configmap.yaml` | Backend and frontend environment configs |
+| `02-backend-deployment.yaml` | Backend pod with health checks and resource limits |
+| `03-frontend-deployment.yaml` | Frontend pod with health checks and resource limits |
+| `04-services.yaml` | ClusterIP service (backend), NodePort service (frontend) |
+| `05-ingress.yaml` | Optional NGINX ingress for production |
+
+### Image Pull Policy
+
+All deployments use **`imagePullPolicy: Never`** to use locally-built images from Minikube.
+
+### Accessing the Application
+
+After successful deployment:
+
+**Frontend (via NodePort):**
+```bash
+# Get Minikube IP
+minikube ip
+
+# Access via browser: http://<minikube-ip>:30300
+# Example: http://192.168.49.2:30300
+```
+
+**Backend (from within cluster):**
+```bash
+# Access via kubectl port-forward
+kubectl port-forward svc/backend-service -n snapsure 8000:8000
+
+# Then access: http://localhost:8000
+```
+
+### Monitor Deployments
+
+**Check deployment status:**
+```bash
+kubectl get deployments -n snapsure
+kubectl get pods -n snapsure -o wide
+kubectl get services -n snapsure
+```
+
+**View pod logs:**
+```bash
+# Backend logs
+kubectl logs -l app=backend -n snapsure --tail=50 -f
+
+# Frontend logs
+kubectl logs -l app=frontend -n snapsure --tail=50 -f
+```
+
+**Describe a pod:**
+```bash
+kubectl describe pod <pod-name> -n snapsure
+```
+
+**Check pod health:**
+```bash
+kubectl get pods -n snapsure -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+```
+
+### Manual Kubernetes Deployment
+
+If you need to deploy manually without Jenkins:
+
+```bash
+# Start Minikube
+minikube start --driver=docker --memory=4096 --cpus=2
+
+# Build images inside Minikube
+minikube docker-env
+eval $(minikube docker-env)  # Load Minikube's Docker daemon
+docker compose build
+
+# Or load pre-built images
+docker save snapsure-backend:latest | minikube image load -
+docker save snapsure-frontend:latest | minikube image load -
+
+# Deploy to Kubernetes
+kubectl create namespace snapsure
+kubectl apply -f k8s/
+
+# Wait for deployment
+kubectl rollout status deployment/backend -n snapsure --timeout=5m
+kubectl rollout status deployment/frontend -n snapsure --timeout=5m
+
+# Access the app
+minikube service frontend-service -n snapsure
+```
+
+### Scaling Replicas
+
+To scale the deployment:
+```bash
+kubectl scale deployment backend -n snapsure --replicas=3
+kubectl scale deployment frontend -n snapsure --replicas=2
+```
+
+### Updating Deployments
+
+After building new images:
+```bash
+# Load images
+docker save snapsure-backend:latest | minikube image load -
+docker save snapsure-frontend:latest | minikube image load -
+
+# Trigger rollout
+kubectl rollout restart deployment/backend -n snapsure
+kubectl rollout restart deployment/frontend -n snapsure
+
+# Verify rollout
+kubectl rollout status deployment/backend -n snapsure
+kubectl rollout status deployment/frontend -n snapsure
+```
+
+### Cleaning Up
+
+```bash
+# Delete deployments
+kubectl delete namespace snapsure
+
+# Stop Minikube
+minikube stop
+
+# Delete Minikube cluster completely
+minikube delete
+```
+
+### Jenkins Pipeline Logs
+
+Monitor pipeline execution:
+
+1. **Open Jenkins** → Select `SnapSure-Pipeline` job
+2. **Click Build Number** → **Console Output**
+3. **View stage logs** including:
+   - Minikube startup status
+   - Docker image load progress
+   - Kubernetes deployment status
+   - Pod verification output
+
+---
+
+## Kubernetes Deployment (Manual - Old Method)
+
+See [k8s/README-K8S.md](k8s/README-K8S.md) for the manual Windows-friendly Minikube workflow.
 
 At a high level:
 
@@ -237,7 +467,7 @@ At a high level:
 ## End-to-End DevOps Flow
 
 ```
-GitHub Push
+GitHub Push to main
     ↓
 Jenkins detects change (webhook or manual trigger)
     ↓
@@ -248,13 +478,32 @@ Stage 2: Build Next.js app, run lint + tests
 Stage 3: docker build → snapsure-backend:latest
          docker build → snapsure-frontend:latest
     ↓
-Stage 4: docker compose up -d
-         curl /health  ← smoke test
+Stage 4: docker compose up -d (all branches)
+         curl /health & /  ← smoke test
+         ✓ App running on localhost:3000 and localhost:8000
     ↓
-Kubernetes (Minikube): kubectl apply -f k8s/
+╔═══════════════════════════════════════════════════════════╗
+║  IF main BRANCH ONLY: Kubernetes Deployment             ║
+╚═══════════════════════════════════════════════════════════╝
     ↓
-App accessible via NodePort 30300
+Stage 5: minikube start (auto-start cluster if not running)
+    ↓
+Stage 6: minikube image load → snapsure-backend:latest
+         minikube image load → snapsure-frontend:latest
+    ↓
+Stage 7: kubectl apply -f k8s/
+         Creates: Namespace → ConfigMaps → Deployments → Services
+    ↓
+Stage 8: kubectl rollout status (verify all pods ready)
+         Displays: Pod status, service endpoints, container logs
+         ✓ App accessible via http://<minikube-ip>:30300
 ```
+
+**Result:**
+- ✓ **Docker Compose**: Running locally for development (all branches)
+- ✓ **Kubernetes**: Running in Minikube for staging/testing (main branch only)
+- ✓ Both deployments use the same Docker images
+- ✓ Automatic error handling and rollback on any stage failure
 
 ---
 
