@@ -207,25 +207,80 @@ pipeline {
                         sh '''
                             set -e
                             echo "Starting Minikube..."
-                            minikube start --driver=docker
+                            STATUS="$(minikube status 2>/dev/null || true)"
+                            if echo "$STATUS" | grep -q "host: Running" && \
+                               echo "$STATUS" | grep -q "kubelet: Running" && \
+                               echo "$STATUS" | grep -q "apiserver: Running"; then
+                                echo "Minikube is healthy."
+                            else
+                                echo "Minikube is missing/unhealthy. Recreating cluster..."
+                                minikube stop >/dev/null 2>&1 || true
+                                minikube delete >/dev/null 2>&1 || true
+                                minikube start --driver=docker
+                            fi
+
                             echo "Waiting for Kubernetes API..."
-                            sleep 40
+                            for i in $(seq 1 18); do
+                                STATUS_NOW="$(minikube status 2>/dev/null || true)"
+                                if echo "$STATUS_NOW" | grep -q "host: Running" && \
+                                   echo "$STATUS_NOW" | grep -q "kubelet: Running" && \
+                                   echo "$STATUS_NOW" | grep -q "apiserver: Running"; then
+                                    break
+                                fi
+                                sleep 10
+                                if [ "$i" = "18" ]; then
+                                    echo "ERROR: Minikube components did not become healthy in time."
+                                    minikube status || true
+                                    exit 1
+                                fi
+                            done
+
                             kubectl cluster-info
                             kubectl get nodes
                         '''
                     } else {
                         powershell '''
+                            $ErrorActionPreference = "Stop"
+
                             Write-Host "Starting Minikube..."
-                            minikube start --driver=docker
-                            if ($LASTEXITCODE -ne 0) { exit 1 }
+
+                            $status = (& minikube status 2>$null | Out-String)
+                            $healthy = ($LASTEXITCODE -eq 0) -and
+                                       ($status -match "host:\\s+Running") -and
+                                       ($status -match "kubelet:\\s+Running") -and
+                                       ($status -match "apiserver:\\s+Running")
+
+                            if ($healthy) {
+                                Write-Host "Minikube is healthy."
+                            } else {
+                                Write-Host "Minikube is missing/unhealthy. Recreating cluster..."
+                                & minikube stop 2>&1 | Out-Host
+                                & minikube delete 2>&1 | Out-Host
+                                & minikube start --driver=docker 2>&1 | Out-Host
+                                if ($LASTEXITCODE -ne 0) { exit 1 }
+                            }
 
                             Write-Host "Waiting for Kubernetes API..."
-                            Start-Sleep -Seconds 40
+                            $ready = $false
+                            for ($i = 1; $i -le 18; $i++) {
+                                $statusNow = (& minikube status 2>$null | Out-String)
+                                $ready = ($LASTEXITCODE -eq 0) -and
+                                         ($statusNow -match "host:\\s+Running") -and
+                                         ($statusNow -match "kubelet:\\s+Running") -and
+                                         ($statusNow -match "apiserver:\\s+Running")
+                                if ($ready) { break }
+                                Start-Sleep -Seconds 10
+                            }
+                            if (-not $ready) {
+                                Write-Host "ERROR: Minikube components did not become healthy in time."
+                                minikube status | Out-Host
+                                exit 1
+                            }
 
-                            kubectl cluster-info
+                            & kubectl cluster-info 2>&1 | Out-Host
                             if ($LASTEXITCODE -ne 0) { exit 1 }
 
-                            kubectl get nodes
+                            & kubectl get nodes 2>&1 | Out-Host
                             if ($LASTEXITCODE -ne 0) { exit 1 }
                         '''
                     }
