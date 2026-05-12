@@ -300,6 +300,16 @@ pipeline {
                         if (isUnix()) {
                             sh '''
                                 set -e
+                                echo "=== Cleaning old Minikube images before load ==="
+                                
+                                # Remove dangling images from Minikube (untagged layers)
+                                echo "Removing dangling images..."
+                                minikube image rm --all || echo "No dangling images to remove"
+                                
+                                # Show current image count before
+                                BEFORE_COUNT=$(minikube image ls | wc -l)
+                                echo "Images before cleanup: $BEFORE_COUNT"
+                                
                                 echo "=== Loading Docker images into Minikube ==="
                                 
                                 # Try to use pv for progress bar if available, fallback to plain docker save
@@ -342,6 +352,16 @@ pipeline {
                             // Windows path — show size & progress via output
                             powershell(script: '''
                                 $ErrorActionPreference = "Continue"
+                                
+                                Write-Host "=== Cleaning old Minikube images before load ===" -ForegroundColor Cyan
+                                
+                                # Remove dangling images from Minikube
+                                Write-Host "Removing dangling images from Minikube..." -ForegroundColor Green
+                                & minikube image rm --all 2>&1 | Out-Host
+                                
+                                # Show image count before
+                                $beforeCount = (& minikube image ls 2>&1 | Measure-Object -Line).Lines
+                                Write-Host "  Images before load: $beforeCount" -ForegroundColor DarkGray
                                 
                                 Write-Host "=== Loading Docker images into Minikube ===" -ForegroundColor Cyan
                                 
@@ -622,6 +642,67 @@ pipeline {
                 }
             }
         }
+
+        // ── Stage 9: Cleanup & Prune Images ──────────────────────────────────
+        //    Aggressive cleanup of dangling layers, old images, and unused data
+        stage('9. Cleanup & Prune Storage') {
+            steps {
+                script {
+                    try {
+                        if (isUnix()) {
+                            sh '''
+                                set -e
+                                echo "=== Stage 9: Cleanup & Prune Storage ==="
+                                
+                                # Prune dangling images from Minikube
+                                echo "Pruning dangling images from Minikube..."
+                                minikube image rm --all 2>/dev/null || echo "  (no dangling images)"
+                                
+                                # Show final Minikube image count
+                                AFTER_COUNT=$(minikube image ls 2>/dev/null | wc -l)
+                                echo "Final images in Minikube: $AFTER_COUNT"
+                                
+                                # Prune local Docker (unused images, layers, build cache)
+                                echo "Pruning local Docker dangling images and build cache..."
+                                DOCKER_PRUNE=$(docker image prune -f --filter "dangling=true" 2>/dev/null | tail -1)
+                                echo "  $DOCKER_PRUNE"
+                                
+                                # Optional: aggressive cleanup (⚠️ be careful here)
+                                # Uncomment if you want to remove ALL unused images (including stopped container images)
+                                # docker image prune -a -f --filter "until=72h"
+                                
+                                echo "✓ Cleanup complete"
+                            '''
+                        } else {
+                            // Windows path
+                            powershell(script: '''
+                                $ErrorActionPreference = "Continue"
+                                
+                                Write-Host "=== Stage 9: Cleanup & Prune Storage ===" -ForegroundColor Cyan
+                                
+                                # Prune dangling images from Minikube
+                                Write-Host "Pruning dangling images from Minikube..." -ForegroundColor Green
+                                & minikube image rm --all 2>&1 | Out-Host
+                                
+                                # Show final Minikube image count
+                                $afterCount = (& minikube image ls 2>&1 | Measure-Object -Line).Lines
+                                Write-Host "  Final images in Minikube: $afterCount" -ForegroundColor DarkGray
+                                
+                                # Prune local Docker
+                                Write-Host "Pruning local Docker dangling images and build cache..." -ForegroundColor Green
+                                $dockerPrune = (& docker image prune -f --filter "dangling=true" 2>&1 | Select-Object -Last 1)
+                                Write-Host "  $dockerPrune" -ForegroundColor DarkGray
+                                
+                                Write-Host "✓ Cleanup complete" -ForegroundColor Green
+                            ''')
+                        }
+                    } catch (Exception e) {
+                        echo "WARNING: Cleanup stage encountered an issue - ${e.message}"
+                        // Don't fail the pipeline for cleanup issues
+                    }
+                }
+            }
+        }
     }
 
     post {
@@ -629,6 +710,24 @@ pipeline {
             echo "Pipeline passed. Build #${BUILD_NUMBER} deployed."
             echo "✓ Docker Compose deployment ready"
             echo "✓ Kubernetes/Minikube deployment successful"
+            script {
+                // Additional cleanup on success
+                if (isUnix()) {
+                    sh '''
+                        echo "Post-success: Removing any unused Docker builder cache..."
+                        docker builder prune -f 2>/dev/null || true
+                        
+                        echo "Post-success: Minikube storage status..."
+                        minikube ssh "df -h /" 2>/dev/null || echo "  (could not check)"
+                    '''
+                } else {
+                    powershell '''
+                        $ErrorActionPreference = "Continue"
+                        Write-Host "Post-success: Removing unused Docker builder cache..." -ForegroundColor Green
+                        & docker builder prune -f 2>&1 | Out-Host
+                    '''
+                }
+            }
         }
         failure {
             echo "Pipeline FAILED. Check stage logs above."
