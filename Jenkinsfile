@@ -292,6 +292,7 @@ pipeline {
         }
 
         // ── Stage 6: Load Docker Images into Minikube ──────────────────────
+        //    Shows progress bar for large images (pv on Unix, timing on Windows)
         stage('6. Load Images to Minikube') {
             steps {
                 script {
@@ -301,64 +302,91 @@ pipeline {
                                 set -e
                                 echo "=== Loading Docker images into Minikube ==="
                                 
-                                # Load backend image
-                                echo "Loading backend image: ${BACKEND_IMAGE}"
-                                docker save ${BACKEND_IMAGE} | minikube image load - || \
-                                minikube image load ${BACKEND_IMAGE}
-                                
-                                # Load frontend image
-                                echo "Loading frontend image: ${FRONTEND_IMAGE}"
-                                docker save ${FRONTEND_IMAGE} | minikube image load - || \
-                                minikube image load ${FRONTEND_IMAGE}
+                                # Try to use pv for progress bar if available, fallback to plain docker save
+                                if command -v pv >/dev/null 2>&1; then
+                                    # Load frontend image with progress bar
+                                    echo "Loading frontend image: ${FRONTEND_IMAGE}"
+                                    FRONTEND_SIZE=$(docker image inspect ${FRONTEND_IMAGE} --format='{{.Size}}')
+                                    echo "Size: $((FRONTEND_SIZE / 1024 / 1024))MB"
+                                    docker save ${FRONTEND_IMAGE} | pv -s ${FRONTEND_SIZE} | minikube image load -
+                                    
+                                    # Load backend image with progress bar
+                                    echo "Loading backend image: ${BACKEND_IMAGE}"
+                                    BACKEND_SIZE=$(docker image inspect ${BACKEND_IMAGE} --format='{{.Size}}')
+                                    echo "Size: $((BACKEND_SIZE / 1024 / 1024))MB"
+                                    docker save ${BACKEND_IMAGE} | pv -s ${BACKEND_SIZE} | minikube image load -
+                                else
+                                    # Fallback: no pv available, just show timing
+                                    echo "Loading frontend image: ${FRONTEND_IMAGE}"
+                                    START_TIME=$(date +%s%N)
+                                    docker save ${FRONTEND_IMAGE} | minikube image load - || minikube image load ${FRONTEND_IMAGE}
+                                    END_TIME=$(date +%s%N)
+                                    ELAPSED=$((($END_TIME - $START_TIME) / 1000000))
+                                    echo "Frontend loaded in $((ELAPSED / 1000))s"
+                                    
+                                    echo "Loading backend image: ${BACKEND_IMAGE}"
+                                    START_TIME=$(date +%s%N)
+                                    docker save ${BACKEND_IMAGE} | minikube image load - || minikube image load ${BACKEND_IMAGE}
+                                    END_TIME=$(date +%s%N)
+                                    ELAPSED=$((($END_TIME - $START_TIME) / 1000000))
+                                    echo "Backend loaded in $((ELAPSED / 1000))s"
+                                fi
                                 
                                 # Verify images are loaded
                                 echo "Verifying images in Minikube..."
                                 minikube image ls | grep snapsure || echo "Checking images..."
                                 
-                                echo "Images loaded successfully."
+                                echo "✓ Images loaded successfully."
                             '''
                         } else {
-                            // Windows path
+                            // Windows path — show size & progress via output
                             powershell(script: '''
                                 $ErrorActionPreference = "Continue"
                                 
-                                Write-Host "=== Loading Docker images into Minikube ==="
+                                Write-Host "=== Loading Docker images into Minikube ===" -ForegroundColor Cyan
                                 
-                                # Load backend image
-                                Write-Host "Loading backend image: $env:BACKEND_IMAGE"
-                                & docker image inspect $env:BACKEND_IMAGE *> $null
-                                if ($LASTEXITCODE -ne 0) {
-                                    Write-Host "ERROR: Backend image not found: $env:BACKEND_IMAGE"
-                                    exit 1
-                                }
-                                & minikube image load $env:BACKEND_IMAGE 2>&1 | Out-Host
-                                if ($LASTEXITCODE -ne 0) {
-                                    Write-Host "ERROR: Failed loading backend image into Minikube"
-                                    exit 1
-                                }
+                                # Load frontend image with size info
+                                Write-Host "Loading frontend image: $env:FRONTEND_IMAGE" -ForegroundColor Green
+                                $frontendInspect = & docker image inspect $env:FRONTEND_IMAGE --format='{{json .}}' | ConvertFrom-Json
+                                $frontendSize = $frontendInspect.Size
+                                Write-Host "  Size: $([Math]::Round($frontendSize / 1MB, 2))MB" -ForegroundColor DarkGray
                                 
-                                # Load frontend image
-                                Write-Host "Loading frontend image: $env:FRONTEND_IMAGE"
-                                & docker image inspect $env:FRONTEND_IMAGE *> $null
+                                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                                & minikube image load $env:FRONTEND_IMAGE 2>&1 | ForEach-Object { Write-Host "  $_" }
+                                $stopwatch.Stop()
                                 if ($LASTEXITCODE -ne 0) {
-                                    Write-Host "ERROR: Frontend image not found: $env:FRONTEND_IMAGE"
+                                    Write-Host "ERROR: Failed loading frontend image into Minikube" -ForegroundColor Red
                                     exit 1
                                 }
-                                & minikube image load $env:FRONTEND_IMAGE 2>&1 | Out-Host
+                                Write-Host "  ✓ Frontend loaded in $($stopwatch.Elapsed.TotalSeconds)s" -ForegroundColor Green
+                                
+                                # Load backend image with size info
+                                Write-Host "Loading backend image: $env:BACKEND_IMAGE" -ForegroundColor Green
+                                $backendInspect = & docker image inspect $env:BACKEND_IMAGE --format='{{json .}}' | ConvertFrom-Json
+                                $backendSize = $backendInspect.Size
+                                Write-Host "  Size: $([Math]::Round($backendSize / 1GB, 2))GB" -ForegroundColor DarkGray
+                                Write-Host "  (This may take several minutes for large images)" -ForegroundColor DarkYellow
+                                
+                                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                                & minikube image load $env:BACKEND_IMAGE 2>&1 | ForEach-Object { 
+                                    Write-Host "  $_"
+                                    # Show progress every 30 seconds
+                                    if ($stopwatch.Elapsed.TotalSeconds % 30 -lt 2) {
+                                        Write-Host "  ⏱ Elapsed: $($stopwatch.Elapsed.TotalSeconds -as [int])s..." -ForegroundColor DarkYellow
+                                    }
+                                }
+                                $stopwatch.Stop()
                                 if ($LASTEXITCODE -ne 0) {
-                                    Write-Host "ERROR: Failed loading frontend image into Minikube"
+                                    Write-Host "ERROR: Failed loading backend image into Minikube" -ForegroundColor Red
                                     exit 1
                                 }
+                                Write-Host "  ✓ Backend loaded in $($stopwatch.Elapsed.TotalSeconds)s" -ForegroundColor Green
                                 
                                 # Verify images
-                                Write-Host "Verifying images in Minikube..."
-                                & minikube image ls 2>&1 | Out-Host
-                                if ($LASTEXITCODE -ne 0) {
-                                    Write-Host "ERROR: Unable to list Minikube images"
-                                    exit 1
-                                }
+                                Write-Host "Verifying images in Minikube..." -ForegroundColor Green
+                                & minikube image ls 2>&1 | Select-String "snapsure" | Out-Host
                                 
-                                Write-Host "Images loaded successfully."
+                                Write-Host "✓ Images loaded successfully." -ForegroundColor Green
                             ''')
                         }
                     } catch (Exception e) {
