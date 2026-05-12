@@ -240,7 +240,10 @@ pipeline {
                         '''
                     } else {
                         powershell '''
-                            $ErrorActionPreference = "Stop"
+                            $ErrorActionPreference = "Continue"
+                            if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+                                $PSNativeCommandUseErrorActionPreference = $false
+                            }
 
                             Write-Host "Starting Minikube..."
 
@@ -605,7 +608,15 @@ pipeline {
                 if (isUnix()) {
                     sh 'echo "Final status:" && kubectl get all -n ${K8S_NAMESPACE} 2>/dev/null || true'
                 } else {
-                    powershell 'Write-Host "Final status:" ; kubectl get all -n $env:K8S_NAMESPACE 2>&1 | Out-Host'
+                    powershell '''
+                        $ErrorActionPreference = "Continue"
+                        if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+                            $PSNativeCommandUseErrorActionPreference = $false
+                        }
+                        Write-Host "Final status:"
+                        & kubectl get all -n $env:K8S_NAMESPACE 2>&1 | Out-Host
+                        exit 0
+                    '''
                 }
             }
         }
