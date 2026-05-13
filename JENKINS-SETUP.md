@@ -111,3 +111,4 @@ kubectl logs -l app=frontend -n snapsure --tail=50
 - The docs here only describe the current pipeline.
 - If you change the Jenkinsfile, update this file with the same level of detail and no more.
 - For Kubernetes manifest details, see [k8s/README-K8S.md](k8s/README-K8S.md).
+- testing jenkins automation today
